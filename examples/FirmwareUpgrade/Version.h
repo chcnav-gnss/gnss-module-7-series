@@ -2,7 +2,7 @@
 #define __VERSION_H
 
 #define MAJOR_VERSION		(0)
-#define SUB_VERSION			(6)
+#define SUB_VERSION			(8)
 
 #endif
 

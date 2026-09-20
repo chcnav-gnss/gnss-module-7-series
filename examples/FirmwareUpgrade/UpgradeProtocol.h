@@ -51,6 +51,9 @@
 
 #define UPGRADE_PROTOCOL_FRAME_END
 
+#define UPGRADE_REQUEST_HISTORY_INVALID		(0U)
+#define UPGRADE_REQUEST_HISTORY_VALID			(1U)
+
 #ifndef UPGRADE_PROTOCOL_USE_CMDSHELL_COOPERATE
 
 	#define UPGRADE_PROTOCOL_USE_CMDSHELL_COOPERATE          (0U)
@@ -94,6 +97,10 @@ typedef struct _FRAME_HANDLE_T
 {
 	PROTOCOL_FRAME_T FrameSend;				/**< Send Frame */
 	PROTOCOL_FRAME_T FrameRecv;				/**< Received Frame */
+	unsigned int PreviousRequestCmdID;			/**< Command ID of the request preceding FrameSend */
+	unsigned char PreviousRequestFrameNumb;	/**< Frame number of the request preceding FrameSend */
+	unsigned char PreviousRequestValid;		/**< Previous request history validity */
+	unsigned short Reserved;					/**< Reserved for four-byte alignment */
 	unsigned char RecvData[UPGRADE_PROTOCOL_LENGTH_MAX]; /**< Receive frame data */
 	FRAME_STRING_T FrameStr;				/**< Convert frames into strings and store them in this variable */
 	unsigned short (*Write)(char *, unsigned short);/**< Frame sending interface, which will be used for frame sending or response */

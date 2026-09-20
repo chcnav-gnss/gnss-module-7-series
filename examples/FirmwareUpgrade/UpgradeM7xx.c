@@ -35,6 +35,8 @@ static unsigned int s_UpgradeStatus = UPGRADE_STATUS_IDLE;
 
 int g_DebugPrintf = 0;
 
+void SendUpgradeFrame(int UartFd, unsigned char* pData, unsigned int DataLen);
+
 void SetDebugPrintf(int DebugPrintf)
 {
 	g_DebugPrintf = DebugPrintf;
@@ -80,6 +82,31 @@ void PrintProgressBar(int Progress)
 
 #endif
 
+/**********************************************************************//**
+@brief  Receive and filter an upgrade response frame
+
+Read UART data and decode it through the frame cache. A complete frame is
+reported as valid only when it is a reply whose command ID and frame number
+match the current request in FrameSend. A reply matching the request immediately
+preceding FrameSend triggers a resend of the cached current request without
+re-encoding it. A reply using the current frame number but the preceding request
+command ID also triggers this resend, which recovers from residual radio control
+replies during the transition to transparent transfer mode. Other unmatched
+frames are discarded so that they cannot be processed by the current upgrade
+state.
+
+@param UartFd			[In] UART file descriptor
+@param pFrameHandle		[In] Frame handle containing the sent and received frames
+
+@retval PROTOCOL_FILTER_OK		A response matching the current request was received
+@retval PROTOCOL_WAIT_CONFIRM	No complete matching response is available yet
+@retval PROTOCOL_FILTER_ERR		Frame decoding failed
+
+@author luoshuaitao
+@date 2026/09/15
+@note FrameSend and FrameStr must retain the request that is currently awaiting
+      a response. The resend path preserves its CmdID, FrameNum and payload.
+**************************************************************************/
 static int UpgradeFrameCacheAndFilter(int UartFd, FRAME_HANDLE_T* pFrameHandle)
 {
 	unsigned char ReadBuf[1024];
@@ -97,9 +124,60 @@ static int UpgradeFrameCacheAndFilter(int UartFd, FRAME_HANDLE_T* pFrameHandle)
 		}
 		else if (Result == FRAME_RESPONSE_OK)
 		{
+			if ((pFrameHandle->FrameRecv.Cmd.Action == FRAME_ACTION_REPLY) &&
+				(pFrameHandle->FrameRecv.Cmd.CmdID == pFrameHandle->FrameSend.Cmd.CmdID) &&
+				(pFrameHandle->FrameRecv.FrameNumb == pFrameHandle->FrameSend.FrameNumb))
+			{
+				UpgradeFrameCleanCache(pFrameHandle);
+
+				return PROTOCOL_FILTER_OK;
+			}
+
+			if ((pFrameHandle->FrameRecv.Cmd.Action == FRAME_ACTION_REPLY) &&
+				(pFrameHandle->PreviousRequestValid == UPGRADE_REQUEST_HISTORY_VALID) &&
+				(pFrameHandle->FrameRecv.Cmd.CmdID == pFrameHandle->PreviousRequestCmdID) &&
+				(pFrameHandle->FrameRecv.FrameNumb == pFrameHandle->PreviousRequestFrameNumb) &&
+				(pFrameHandle->FrameStr.Len > 0U))
+			{
+				DEBUG_PRINTF("Resend pending request: CmdID=0x%06X, FrameNum=%u, Len=%u; received previous reply(CmdID=0x%06X, FrameNum=%u)\r\n",
+					(unsigned int)pFrameHandle->FrameSend.Cmd.CmdID,
+					(unsigned int)pFrameHandle->FrameSend.FrameNumb,
+					(unsigned int)pFrameHandle->FrameStr.Len,
+					(unsigned int)pFrameHandle->FrameRecv.Cmd.CmdID,
+					(unsigned int)pFrameHandle->FrameRecv.FrameNumb);
+				UpgradeFrameCleanCache(pFrameHandle);
+				SendUpgradeFrame(UartFd, pFrameHandle->FrameStr.StrBuf, pFrameHandle->FrameStr.Len);
+
+				return PROTOCOL_WAIT_CONFIRM;
+			}
+
+			if ((pFrameHandle->FrameRecv.Cmd.Action == FRAME_ACTION_REPLY) &&
+				(pFrameHandle->PreviousRequestValid == UPGRADE_REQUEST_HISTORY_VALID) &&
+				(pFrameHandle->FrameRecv.FrameNumb == pFrameHandle->FrameSend.FrameNumb) &&
+				(pFrameHandle->FrameRecv.Cmd.CmdID == pFrameHandle->PreviousRequestCmdID) &&
+				(pFrameHandle->FrameRecv.Cmd.CmdID != pFrameHandle->FrameSend.Cmd.CmdID) &&
+				(pFrameHandle->FrameStr.Len > 0U))
+			{
+				DEBUG_PRINTF("Resend pending request: CmdID=0x%06X, FrameNum=%u, Len=%u; received same-frame unmatched reply(CmdID=0x%06X)\r\n",
+					(unsigned int)pFrameHandle->FrameSend.Cmd.CmdID,
+					(unsigned int)pFrameHandle->FrameSend.FrameNumb,
+					(unsigned int)pFrameHandle->FrameStr.Len,
+					(unsigned int)pFrameHandle->FrameRecv.Cmd.CmdID);
+				UpgradeFrameCleanCache(pFrameHandle);
+				SendUpgradeFrame(UartFd, pFrameHandle->FrameStr.StrBuf, pFrameHandle->FrameStr.Len);
+
+				return PROTOCOL_WAIT_CONFIRM;
+			}
+
+			DEBUG_PRINTF("Ignore unmatched response: Expected(CmdID=0x%06X, FrameNum=%u), Received(Action=%u, CmdID=0x%06X, FrameNum=%u)\r\n",
+				(unsigned int)pFrameHandle->FrameSend.Cmd.CmdID,
+				(unsigned int)pFrameHandle->FrameSend.FrameNumb,
+				(unsigned int)pFrameHandle->FrameRecv.Cmd.Action,
+				(unsigned int)pFrameHandle->FrameRecv.Cmd.CmdID,
+				(unsigned int)pFrameHandle->FrameRecv.FrameNumb);
 			UpgradeFrameCleanCache(pFrameHandle);
 
-			return PROTOCOL_FILTER_OK;
+			return PROTOCOL_WAIT_CONFIRM;
 		}
 		else
 		{
@@ -218,7 +296,7 @@ static int PrintfUseTime(struct timeval* pStartTime, char* pOutputStr)
 @param FileSize			[In] Firmware file size
 @param pCmdArgs			[In] cmd args
 
-@retval <0:error =0:success
+@retval UPGRADE_RESULT_OK:success, otherwise:upgrade procedure error
 
 @author luoshuaitao
 @date 2024/02/21
@@ -227,6 +305,7 @@ static int PrintfUseTime(struct timeval* pStartTime, char* pOutputStr)
 static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T* pFrameHandle, unsigned int FileSize, CMD_ARGS_T* pCmdArgs)
 {
 	unsigned int UpgradeStatus = GetUpgradeStatus();
+	int UpgradeResult = UPGRADE_RESULT_INTERNAL_FAILED;
 	int FrameMaxLen = 0;
 	unsigned int RequestAddr = 0, RequestSize = 0, RequestTotalSize = 0;
 	unsigned int GetUpdateStatusCount = 0;
@@ -242,13 +321,13 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 
 	if ((UartFd < 0) || (!pFirmwareFile) || (!pFrameHandle) || (!pCmdArgs))
 	{
-		return -1;
+		return UPGRADE_RESULT_INVALID_ARG;
 	}
 
 	if (UPGRADE_STATUS_IDLE != UpgradeStatus)
 	{
 		printf("Upgrade status is error: %d!\r\n", UpgradeStatus);
-		return -1;
+		return UPGRADE_RESULT_STATE_FAILED;
 	}
 #if (PRINTF_USETIME_ENABLE != 0)
 	gettimeofday(&StartTime, NULL);
@@ -261,6 +340,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 
 		if (TimeCntr >= UPDATE_OVERTIME)
 		{
+			UpgradeResult = UPGRADE_RESULT_TIMEOUT;
 			SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 			printf("\r\nUpgradeStatus: %d receiver over time!\r\n", UpgradeStatus);
 		}
@@ -288,6 +368,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					PrintfUseTime(&StartTime, "UPGRADE_STATUS_OPEN_RADIO_UPDATE_TRANSFER_MODE:");
 					if (SetRadioUpdateTransferModeReplyHandle(pFrameHandle) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nOpen radio update transfer mode fail!\r\n");
 						break;
@@ -305,6 +386,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					PrintfUseTime(&StartTime, "UPGRADE_STATUS_GET_DEVICE_MAX_FRAME_LEN:");
 					if (GetFrameMaxLenReplyHandle(pFrameHandle, &FrameMaxLen) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nGet device max frame length fail!\r\n");
 						break;
@@ -326,6 +408,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					}
 					if (Index >= TableSize)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("Module FrameMaxLen error:%d\r\n", FrameDataLen);
 						break;
@@ -352,6 +435,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					PrintfUseTime(&StartTime, "UPGRADE_STATUS_SEND_MAX_FRAME_LEN:");
 					if (SendFrameMaxLenReplyHandle(pFrameHandle) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nSend device max frame length fail!\r\n");
 						break;
@@ -369,6 +453,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					DEVICE_INFO_T DeviceInfo = {{0}};
 					if (GetDeviceInfoReplyHandle(pFrameHandle, &DeviceInfo) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nGet device information fail!\r\n");
 						break;
@@ -377,6 +462,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					ReadLen = ReadFirmwareData(pFirmwareFile, 0, (unsigned char*)&FileInfo, sizeof(FILE_INFO_T));
 					if ((ReadLen < 0) || (ReadLen != sizeof(FILE_INFO_T)))
 					{
+						UpgradeResult = UPGRADE_RESULT_FILE_READ_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nRead file information fail!\r\n");
 						break;
@@ -400,6 +486,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					PrintfUseTime(&StartTime, "UPGRADE_STATUS_REQUEST_UPGRADE:");
 					if (RequestUpgradeReplyHandle(pFrameHandle) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nRequest upgrade fail!\r\n");
 						break;
@@ -425,6 +512,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					PrintfUseTime(&StartTime, "UPGRADE_STATUS_SET_FAST_UPDATE_MODE:");
 					if (SetFastUpdateModeReplyHandle(pFrameHandle) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nSet fast update mode fail!\r\n");
 						break;
@@ -441,6 +529,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					PrintfUseTime(&StartTime, "UPGRADE_STATUS_GET_DEVICE_STATUS:");
 					if (GetDeviceStatusReplyHandle(pFrameHandle) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nGet device status fail!\r\n");
 						break;
@@ -459,6 +548,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 
 					if (SendSubPackageFirmwareReplyHandle(pFrameHandle, TransportMaxLen, &RequestAddr, &RequestSize) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nSend firmware reply error, Please check firmware version!\r\n");
 						break;
@@ -472,6 +562,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 						ReadLen = ReadFirmwareData(pFirmwareFile, RequestAddr, ReadBuf, RequestSize);
 						if ((ReadLen < 0) || (ReadLen != RequestSize))
 						{
+							UpgradeResult = UPGRADE_RESULT_FILE_READ_FAILED;
 							SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 							printf("\r\nRead firmware data fail!\r\n");
 							break;
@@ -479,6 +570,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 						Result = UpgradeFrameDataEncode(pFrameHandle, CHC_CMD_UPDATE_SEND_FIRMWARE, ReadBuf, RequestSize);
 						if (Result != 0)
 						{
+							UpgradeResult = UPGRADE_RESULT_ENCODE_FAILED;
 							SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 							printf("\r\nFrame Encode Error is %d\r\n",Result);
 							break;
@@ -510,6 +602,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					PrintfUseTime(&StartTime, "UPGRADE_STATUS_REQUEST_REBOOT:");
 					if (RequestRebootReplyHandle(pFrameHandle) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nGet update status fail!\r\n");
 						break;
@@ -538,6 +631,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					PrintfUseTime(&StartTime, "UPGRADE_STATUS_CLOSE_RADIO_UPDATE_TRANSFER_MODE:");
 					if (SetRadioUpdateTransferModeReplyHandle(pFrameHandle) < 0)
 					{
+						UpgradeResult = UPGRADE_RESULT_PROTOCOL_FAILED;
 						SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 						printf("\r\nClose radio update transfer mode fail!\r\n");
 						break;
@@ -560,6 +654,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 					{
 						if (++GetUpdateStatusCount > 50) /**< wait 10s*/
 						{
+							UpgradeResult = UPGRADE_RESULT_TIMEOUT;
 							SetUpgradeStatus(UPGRADE_STATUS_FAIL);
 							printf("\r\nGet update status fail!\r\n");
 							break;
@@ -577,19 +672,23 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 				break;
 			case UPGRADE_STATUS_FAIL:
 				PrintfUseTime(&StartTime, "UPGRADE_STATUS_FAIL:");
-				printf("\r\nUpgrade fail!\r\n");
+				printf("\r\nUpgrade fail! result=%d\r\n", UpgradeResult);
 				SetUpgradeStatus(UPGRADE_STATUS_IDLE);
-				return 0;
+				if (UPGRADE_RESULT_OK == UpgradeResult)
+				{
+					return UPGRADE_RESULT_STATE_FAILED;
+				}
+				return UpgradeResult;
 			case UPGRADE_STATUS_SUCCESS:
 				PrintfUseTime(&StartTime, "UPGRADE_STATUS_SUCCESS:");
 
 				PrintfUseTime(&StartTime1, "UPGRADE_STATUS_SUCCESS Total:");
 				printf("\r\nUpgrade success!\r\n");
 				SetUpgradeStatus(UPGRADE_STATUS_IDLE);
-				return 0;
+				return UPGRADE_RESULT_OK;
 			default:
 				SetUpgradeStatus(UPGRADE_STATUS_IDLE);
-				return -1;
+				return UPGRADE_RESULT_STATE_FAILED;
 		}
 
 		NewProgress = (int)((double)RequestTotalSize / FileSize * 100);
@@ -613,7 +712,7 @@ static int SubPackageUpgradeProc(int UartFd, FILE* pFirmwareFile, FRAME_HANDLE_T
 		TimeCntr++;
 	}
 
-	return -1;
+	return UPGRADE_RESULT_INTERNAL_FAILED;
 }
 
 /**********************************************************************//**
@@ -831,7 +930,7 @@ static int CheckPackageM7xx(unsigned char* pFileBuf, int FileSize)
 @param pFirmwarePath		[In] firmware path
 @param pFileSize			[Out] firmware file size
 
-@retval <0:error =0:success
+@retval UPGRADE_RESULT_OK:success, otherwise:package check error
 
 @author luoshuaitao
 @date 2024/09/04
@@ -843,17 +942,17 @@ static int CheckUpdatePackage(char *pFirmwarePath, int* pFileSize)
 	unsigned char* pFileBuf = NULL;
 	int ReadLen;
 
-	if (!pFirmwarePath)
+	if ((!pFirmwarePath) || (!pFileSize))
 	{
-		printf("Firmware path is null\r\n");
-		return -1;
+		printf("Firmware path or file size is null\r\n");
+		return UPGRADE_RESULT_INVALID_ARG;
 	}
 
 	FILE* pFirmwareFile = fopen(pFirmwarePath, "rb");
 	if (!pFirmwareFile)
 	{
 		printf("Failed to open firmware file\r\n");
-		return -1;
+		return UPGRADE_RESULT_PACKAGE_CHECK_FAILED;
 	}
 
 	fseek(pFirmwareFile, 0, SEEK_END);
@@ -866,7 +965,7 @@ static int CheckUpdatePackage(char *pFirmwarePath, int* pFileSize)
 	{
 		printf("Malloc file size buffer error\n");
 		fclose(pFirmwareFile);
-		return -1;
+		return UPGRADE_RESULT_PACKAGE_CHECK_FAILED;
 	}
 
 	ReadLen = fread(pFileBuf, sizeof(unsigned char), FirmwareFileSize, pFirmwareFile);
@@ -875,7 +974,7 @@ static int CheckUpdatePackage(char *pFirmwarePath, int* pFileSize)
 		printf("Fail to read package body, please check buffsize[%d,%d]\r\n", ReadLen, FirmwareFileSize);
 		free(pFileBuf);
 		fclose(pFirmwareFile);
-		return -1;
+		return UPGRADE_RESULT_PACKAGE_CHECK_FAILED;
 	}
 
 	fclose(pFirmwareFile);
@@ -884,14 +983,14 @@ static int CheckUpdatePackage(char *pFirmwarePath, int* pFileSize)
 	{
 		printf("Check firmware package file error\n");
 		free(pFileBuf);
-		return -1;
+		return UPGRADE_RESULT_PACKAGE_CHECK_FAILED;
 	}
 
 	free(pFileBuf);
 
 	*pFileSize = FirmwareFileSize;
 
-	return 0;
+	return UPGRADE_RESULT_OK;
 }
 
 /**********************************************************************//**
@@ -899,7 +998,7 @@ static int CheckUpdatePackage(char *pFirmwarePath, int* pFileSize)
 
 @param pCmdArgs		[In] cmd args
 
-@retval <0:error =0:success
+@retval UPGRADE_RESULT_OK:success, otherwise:upgrade procedure error
 
 @author luoshuaitao
 @date 2024/09/04
@@ -907,49 +1006,62 @@ static int CheckUpdatePackage(char *pFirmwarePath, int* pFileSize)
 **************************************************************************/
 int UpgradeM7xx(CMD_ARGS_T* pCmdArgs)
 {
-	int UartFd;
+	int UartFd = -1;
 	int FirmwareFileSize = 0;
+	int UpgradeResult = UPGRADE_RESULT_INTERNAL_FAILED;
 	FRAME_HANDLE_T FrameHandle;
+	FILE* pFirmwareFile = NULL;
 
 	if (!pCmdArgs)
 	{
-		return -1;
+		return UPGRADE_RESULT_INVALID_ARG;
 	}
 
-	CheckUpdatePackage(pCmdArgs->PkgPath, &FirmwareFileSize);
+	UpgradeResult = CheckUpdatePackage(pCmdArgs->PkgPath, &FirmwareFileSize);
+	if (UPGRADE_RESULT_OK != UpgradeResult)
+	{
+		return UpgradeResult;
+	}
+
+	if (FitBaudrate(pCmdArgs->Device, pCmdArgs->Baudrate) < 0)
+	{
+		printf("Fit baudrate error!\r\n");
+		return UPGRADE_RESULT_UART_CONFIG_FAILED;
+	}
 
 	UartFd = UartOpen(pCmdArgs->Device, 0);
 	if (UartFd < 0)
 	{
 		printf("Uart open error!\r\n");
-		return -1;
+		return UPGRADE_RESULT_UART_OPEN_FAILED;
 	}
 
 	if(UartOptionSet(UartFd, pCmdArgs->Baudrate, 8, 1, 'n') < 0)
 	{
 		printf("Uart set option error!\r\n");
-		close(UartFd);
-		return -1;
+		UartClose(UartFd);
+		return UPGRADE_RESULT_UART_CONFIG_FAILED;
 	}
 
-	FILE* pFirmwareFile = fopen(pCmdArgs->PkgPath, "rb");
+	pFirmwareFile = fopen(pCmdArgs->PkgPath, "rb");
 	if (!pFirmwareFile)
 	{
 		printf("Failed to open firmware file\r\n");
-		close(UartFd);
-		return 1;
+		UartClose(UartFd);
+		return UPGRADE_RESULT_FILE_OPEN_FAILED;
 	}
 
 	UpgradeFrameInit(&FrameHandle, 0, 0);
 
-	if (SubPackageUpgradeProc(UartFd, pFirmwareFile, &FrameHandle, FirmwareFileSize, pCmdArgs) < 0)
+	UpgradeResult = SubPackageUpgradeProc(UartFd, pFirmwareFile, &FrameHandle, FirmwareFileSize, pCmdArgs);
+	if (UPGRADE_RESULT_OK != UpgradeResult)
 	{
-		printf("Sub package upgrade fail\r\n");
+		printf("Sub package upgrade fail, result=%d\r\n", UpgradeResult);
 	}
 
 	fclose(pFirmwareFile);
 	UartClose(UartFd);
 
-	return 0;
+	return UpgradeResult;
 }
 

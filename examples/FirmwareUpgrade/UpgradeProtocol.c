@@ -250,6 +250,22 @@ FRAME_RESPONSE_STATUS_E UpgradeFrameEncode(FRAME_HANDLE_T* pFrameHandle, unsigne
 		return FRAME_RESPONSE_NOT_INIT;
 	}
 
+	if ((Action == FRAME_ACTION_SEND_NO_REPLY) || (Action == FRAME_ACTION_SEND))
+	{
+		if (pFrameStr->Len > 0U)
+		{
+			pFrameHandle->PreviousRequestCmdID = pFrameHandle->FrameSend.Cmd.CmdID;
+			pFrameHandle->PreviousRequestFrameNumb = pFrameHandle->FrameSend.FrameNumb;
+			pFrameHandle->PreviousRequestValid = UPGRADE_REQUEST_HISTORY_VALID;
+		}
+		else
+		{
+			pFrameHandle->PreviousRequestCmdID = 0U;
+			pFrameHandle->PreviousRequestFrameNumb = 0U;
+			pFrameHandle->PreviousRequestValid = UPGRADE_REQUEST_HISTORY_INVALID;
+		}
+	}
+
 	HeaderSize = sizeof(pFrameHandle->FrameSend.Header) + sizeof(pFrameHandle->FrameSend.Version);
 	EndSize = sizeof(pFrameHandle->FrameSend.CRC);
 
